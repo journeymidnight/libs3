@@ -42,6 +42,7 @@ void response_headers_handler_initialize(ResponseHeadersHandler *handler)
     handler->responseProperties.requestId2 = 0;
     handler->responseProperties.contentType = 0;
     handler->responseProperties.contentLength = 0;
+    handler->responseProperties.nextAppendPosition = 0;
     handler->responseProperties.server = 0;
     handler->responseProperties.eTag = 0;
     handler->responseProperties.lastModified = -1;
@@ -144,6 +145,19 @@ void response_headers_handler_add(ResponseHeadersHandler *handler,
             handler->responseProperties.contentLength *= 10;
             handler->responseProperties.contentLength += (*c++ - '0');
         }
+    }
+    else if (!strncasecmp(header, "x-amz-next-append-position", namelen)) {
+        handler->responseProperties.nextAppendPosition = 0;
+        while (*c) {
+            handler->responseProperties.nextAppendPosition *= 10;
+            handler->responseProperties.nextAppendPosition += (*c++ - '0');
+        }
+    }
+    else if (!strncasecmp(header, "x-amz-object-type", namelen)) {
+        responseProperties->objectType = 
+            string_multibuffer_current(handler->responsePropertyStrings);
+        string_multibuffer_add(handler->responsePropertyStrings, c, 
+                               valuelen, fit);
     }
     else if (!strncasecmp(header, "Server", namelen)) {
         responseProperties->server = 

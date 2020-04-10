@@ -18,6 +18,7 @@ S3_initialize
 S3_list_bucket
 S3_list_service
 S3_put_object
+S3_append_object
 S3_runall_request_context
 S3_runonce_request_context
 S3_set_acl

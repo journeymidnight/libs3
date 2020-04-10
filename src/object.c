@@ -79,6 +79,51 @@ void S3_put_object(const S3BucketContext *bucketContext, const char *key,
     request_perform(&params, requestContext);
 }
 
+// append object ----------------------------------------------------------------
+
+void S3_append_object(const S3BucketContext *bucketContext, const char *key,
+                   uint64_t contentLength,
+                   uint64_t position,
+                   const S3PutProperties *putProperties,
+                   S3RequestContext *requestContext,
+                   int timeoutMs,
+                   const S3PutObjectHandler *handler, void *callbackData)
+{
+    // Set up the RequestParams
+    char queryParams[512];
+    snprintf(queryParams, 512, "position=%lu", position);
+    RequestParams params =
+    {
+        HttpRequestTypeAPPEND,                        // httpRequestType
+        { bucketContext->hostName,                    // hostName
+          bucketContext->bucketName,                  // bucketName
+          bucketContext->protocol,                    // protocol
+          bucketContext->uriStyle,                    // uriStyle
+          bucketContext->accessKeyId,                 // accessKeyId
+          bucketContext->secretAccessKey,             // secretAccessKey
+          bucketContext->securityToken,               // securityToken
+          bucketContext->authRegion },                // authRegion
+        key,                                          // key
+        queryParams,                                  // queryParams
+        "append",                                     // subResource
+        0,                                            // copySourceBucketName
+        0,                                            // copySourceKey
+        0,                                            // getConditions
+        0,                                            // startByte
+        0,                                            // byteCount
+        putProperties,                                // putProperties
+        handler->responseHandler.propertiesCallback,  // propertiesCallback
+        handler->putObjectDataCallback,               // toS3Callback
+        contentLength,                                // toS3CallbackTotalSize
+        0,                                            // fromS3Callback
+        handler->responseHandler.completeCallback,    // completeCallback
+        callbackData,                                 // callbackData
+        timeoutMs                                     // timeoutMs
+    };
+
+    // Perform the request
+    request_perform(&params, requestContext);
+}
 
 // copy object ---------------------------------------------------------------
 

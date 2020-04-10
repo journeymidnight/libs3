@@ -299,6 +299,27 @@ static void usageExit(FILE *out)
 "     [upload-id]        : Upload-id of a uncomplete multipart upload, if you \n"
 "                          want to continue to put the object, you must specifil\n"
 "\n"
+"   append               : Append an object\n"
+"     <bucket>/<key>     : Bucket/key to append object to\n"
+"     [filename]         : Filename to read source data from "
+                          "(default is stdin)\n"
+"     [contentLength]    : How many bytes of source data to put (required if\n"
+"                          source file is stdin)\n"
+"     [cacheControl]     : Cache-Control HTTP header string to associate with\n"
+"                          object\n"
+"     [contentType]      : Content-Type HTTP header string to associate with\n"
+"                          object\n"
+"     [md5]              : MD5 for validating source data\n"
+"     [contentDispositionFilename] : Content-Disposition filename string to\n"
+"                          associate with object\n"
+"     [contentEncoding]  : Content-Encoding HTTP header string to associate\n"
+"                          with object\n"
+"     [expires]          : Expiration date to associate with object\n"
+"     [cannedAcl]        : Canned ACL for the object (see Canned ACLs)\n"
+"     [x-amz-meta-...]]  : Metadata headers to associate with the object\n"
+"     [useServerSideEncryption] : Whether or not to use server-side\n"
+"                          encryption for the object\n"
+"\n"
 "   copy                 : Copies an object; if any options are set, the "
                           "entire\n"
 "                          metadata of the object is replaced\n"
@@ -798,6 +819,11 @@ static S3Status responsePropertiesCallback
         printf("Content-Length: %llu\n",
                (unsigned long long) properties->contentLength);
     }
+    if (properties->nextAppendPosition > 0) {
+        printf("x-amz-next-append-position: %llu\n",
+               (unsigned long long) properties->contentLength);
+    }
+    print_nonnull("x-amz-object-type", objectType);
     print_nonnull("Server", server);
     print_nonnull("ETag", eTag);
     if (properties->lastModified > 0) {
@@ -2596,6 +2622,400 @@ upload:
 }
 
 
+// append object ----------------------------------------------------------------
+
+typedef struct append_object_callback_data
+{
+    FILE *infile;
+    growbuffer *gb;
+    uint64_t contentLength, originalContentLength;
+    uint64_t totalContentLength, totalOriginalContentLength;
+    int noStatus;
+} append_object_callback_data;
+
+
+static int appendObjectDataCallback(int bufferSize, char *buffer,
+                                 void *callbackData)
+{
+    append_object_callback_data *data =
+        (append_object_callback_data *) callbackData;
+
+    int ret = 0;
+
+    if (data->contentLength) {
+        int toRead = ((data->contentLength > (unsigned) bufferSize) ?
+                      (unsigned) bufferSize : data->contentLength);
+        if (data->gb) {
+            growbuffer_read(&(data->gb), toRead, &ret, buffer);
+        }
+        else if (data->infile) {
+            ret = fread(buffer, 1, toRead, data->infile);
+        }
+    }
+
+    data->contentLength -= ret;
+    data->totalContentLength -= ret;
+
+    if (data->contentLength && !data->noStatus) {
+        // Avoid a weird bug in MingW, which won't print the second integer
+        // value properly when it's in the same call, so print separately
+        printf("%llu bytes remaining ",
+               (unsigned long long) data->totalContentLength);
+        printf("(%d%% complete) ...\n",
+               (int) (((data->totalOriginalContentLength -
+                        data->totalContentLength) * 100) /
+                      data->totalOriginalContentLength));
+    }
+
+    return ret;
+}
+
+
+typedef struct head_object_callback_data
+{
+    int appendable;
+    uint64_t nextAppendPosition;
+} head_object_callback_data;
+
+static S3Status responsePropertiesForHeadBeforeAppendCallback
+    (const S3ResponseProperties *properties, void *callbackData)
+{
+    head_object_callback_data *data = (head_object_callback_data *)callbackData;
+    if (!strcmp(properties->objectType,"Appendable")) {
+        data->appendable = 1;
+        data->nextAppendPosition = properties->nextAppendPosition;
+    }
+
+    if (!showResponsePropertiesG) {
+        return S3StatusOK;
+    }
+
+#define print_nonnull(name, field)                                 \
+    do {                                                           \
+        if (properties-> field) {                                  \
+            printf("%s: %s\n", name, properties-> field);          \
+        }                                                          \
+    } while (0)
+
+    print_nonnull("Content-Type", contentType);
+    print_nonnull("Request-Id", requestId);
+    print_nonnull("Request-Id-2", requestId2);
+    if (properties->contentLength > 0) {
+        printf("Content-Length: %llu\n",
+               (unsigned long long) properties->contentLength);
+    }
+    if (properties->nextAppendPosition > 0) {
+        printf("x-amz-next-append-position: %llu\n",
+               (unsigned long long) properties->contentLength);
+    }
+    print_nonnull("x-amz-object-type", objectType);
+    print_nonnull("Server", server);
+    print_nonnull("ETag", eTag);
+    if (properties->lastModified > 0) {
+        char timebuf[256];
+        time_t t = (time_t) properties->lastModified;
+        // gmtime is not thread-safe but we don't care here.
+        strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
+        printf("Last-Modified: %s\n", timebuf);
+    }
+    int i;
+    for (i = 0; i < properties->metaDataCount; i++) {
+        printf("x-amz-meta-%s: %s\n", properties->metaData[i].name,
+               properties->metaData[i].value);
+    }
+    if (properties->usesServerSideEncryption) {
+        printf("UsesServerSideEncryption: true\n");
+    }
+
+    return S3StatusOK;
+}
+
+static void append_object(int argc, char **argv, int optindex)
+{
+    if (optindex == argc) {
+        fprintf(stderr, "\nERROR: Missing parameter: bucket/key\n");
+        usageExit(stderr);
+    }
+
+    // Split bucket/key
+    char *slash = argv[optindex];
+    while (*slash && (*slash != '/')) {
+        slash++;
+    }
+    if (!*slash || !*(slash + 1)) {
+        fprintf(stderr, "\nERROR: Invalid bucket/key name: %s\n",
+                argv[optindex]);
+        usageExit(stderr);
+    }
+    *slash++ = 0;
+
+    const char *bucketName = argv[optindex++];
+    const char *key = slash;
+    const char *filename = 0;
+    uint64_t contentLength = 0;
+    const char *cacheControl = 0, *contentType = 0, *md5 = 0;
+    const char *contentDispositionFilename = 0, *contentEncoding = 0;
+    int64_t expires = -1;
+    S3CannedAcl cannedAcl = S3CannedAclPrivate;
+    int metaPropertiesCount = 0;
+    S3NameValue metaProperties[S3_MAX_METADATA_COUNT];
+    char useServerSideEncryption = 0;
+    int noStatus = 0;
+    head_object_callback_data head_data;
+
+    while (optindex < argc) {
+        char *param = argv[optindex++];
+        if (!strncmp(param, FILENAME_PREFIX, FILENAME_PREFIX_LEN)) {
+            filename = &(param[FILENAME_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, CONTENT_LENGTH_PREFIX,
+                          CONTENT_LENGTH_PREFIX_LEN)) {
+            contentLength = convertInt(&(param[CONTENT_LENGTH_PREFIX_LEN]),
+                                       "contentLength");
+            if (contentLength > (5LL * 1024 * 1024 * 1024 * 1024)) {
+                fprintf(stderr, "\nERROR: contentLength must be no greater "
+                        "than 5 TB\n");
+                usageExit(stderr);
+            }
+        }
+        else if (!strncmp(param, CACHE_CONTROL_PREFIX,
+                          CACHE_CONTROL_PREFIX_LEN)) {
+            cacheControl = &(param[CACHE_CONTROL_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, CONTENT_TYPE_PREFIX,
+                          CONTENT_TYPE_PREFIX_LEN)) {
+            contentType = &(param[CONTENT_TYPE_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, MD5_PREFIX, MD5_PREFIX_LEN)) {
+            md5 = &(param[MD5_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, CONTENT_DISPOSITION_FILENAME_PREFIX,
+                          CONTENT_DISPOSITION_FILENAME_PREFIX_LEN)) {
+            contentDispositionFilename =
+                &(param[CONTENT_DISPOSITION_FILENAME_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, CONTENT_ENCODING_PREFIX,
+                          CONTENT_ENCODING_PREFIX_LEN)) {
+            contentEncoding = &(param[CONTENT_ENCODING_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, EXPIRES_PREFIX, EXPIRES_PREFIX_LEN)) {
+            expires = parseIso8601Time(&(param[EXPIRES_PREFIX_LEN]));
+            if (expires < 0) {
+                fprintf(stderr, "\nERROR: Invalid expires time "
+                        "value; ISO 8601 time format required\n");
+                usageExit(stderr);
+            }
+        }
+        else if (!strncmp(param, X_AMZ_META_PREFIX, X_AMZ_META_PREFIX_LEN)) {
+            if (metaPropertiesCount == S3_MAX_METADATA_COUNT) {
+                fprintf(stderr, "\nERROR: Too many x-amz-meta- properties, "
+                        "limit %lu: %s\n",
+                        (unsigned long) S3_MAX_METADATA_COUNT, param);
+                usageExit(stderr);
+            }
+            char *name = &(param[X_AMZ_META_PREFIX_LEN]);
+            char *value = name;
+            while (*value && (*value != '=')) {
+                value++;
+            }
+            if (!*value || !*(value + 1)) {
+                fprintf(stderr, "\nERROR: Invalid parameter: %s\n", param);
+                usageExit(stderr);
+            }
+            *value++ = 0;
+            metaProperties[metaPropertiesCount].name = name;
+            metaProperties[metaPropertiesCount++].value = value;
+        }
+        else if (!strncmp(param, USE_SERVER_SIDE_ENCRYPTION_PREFIX,
+                          USE_SERVER_SIDE_ENCRYPTION_PREFIX_LEN)) {
+            const char *val = &(param[USE_SERVER_SIDE_ENCRYPTION_PREFIX_LEN]);
+            if (!strcmp(val, "true") || !strcmp(val, "TRUE") ||
+                !strcmp(val, "yes") || !strcmp(val, "YES") ||
+                !strcmp(val, "1")) {
+                useServerSideEncryption = 1;
+            }
+            else {
+                useServerSideEncryption = 0;
+            }
+        }
+        else if (!strncmp(param, CANNED_ACL_PREFIX, CANNED_ACL_PREFIX_LEN)) {
+            char *val = &(param[CANNED_ACL_PREFIX_LEN]);
+            if (!strcmp(val, "private")) {
+                cannedAcl = S3CannedAclPrivate;
+            }
+            else if (!strcmp(val, "public-read")) {
+                cannedAcl = S3CannedAclPublicRead;
+            }
+            else if (!strcmp(val, "public-read-write")) {
+                cannedAcl = S3CannedAclPublicReadWrite;
+            }
+            else if (!strcmp(val, "bucket-owner-full-control")) {
+                cannedAcl = S3CannedAclBucketOwnerFullControl;
+            }
+            else if (!strcmp(val, "authenticated-read")) {
+                cannedAcl = S3CannedAclAuthenticatedRead;
+            }
+            else {
+                fprintf(stderr, "\nERROR: Unknown canned ACL: %s\n", val);
+                usageExit(stderr);
+            }
+        }
+        else if (!strncmp(param, NO_STATUS_PREFIX, NO_STATUS_PREFIX_LEN)) {
+            const char *ns = &(param[NO_STATUS_PREFIX_LEN]);
+            if (!strcmp(ns, "true") || !strcmp(ns, "TRUE") ||
+                !strcmp(ns, "yes") || !strcmp(ns, "YES") ||
+                !strcmp(ns, "1")) {
+                noStatus = 1;
+            }
+        }
+        else {
+            fprintf(stderr, "\nERROR: Unknown param: %s\n", param);
+            usageExit(stderr);
+        }
+    }
+
+    append_object_callback_data data;
+
+    data.infile = 0;
+    data.gb = 0;
+    data.noStatus = noStatus;
+
+    if (filename) {
+        if (!contentLength) {
+            struct stat statbuf;
+            // Stat the file to get its length
+            if (stat(filename, &statbuf) == -1) {
+                fprintf(stderr, "\nERROR: Failed to stat file %s: ",
+                        filename);
+                perror(0);
+                exit(-1);
+            }
+            contentLength = statbuf.st_size;
+        }
+        // Open the file
+        if (!(data.infile = fopen(filename, "r" FOPEN_EXTRA_FLAGS))) {
+            fprintf(stderr, "\nERROR: Failed to open input file %s: ",
+                    filename);
+            perror(0);
+            exit(-1);
+        }
+    }
+    else {
+        // Read from stdin.  If contentLength is not provided, we have
+        // to read it all in to get contentLength.
+        if (!contentLength) {
+            // Read all if stdin to get the data
+            char buffer[64 * 1024];
+            while (1) {
+                int amtRead = fread(buffer, 1, sizeof(buffer), stdin);
+                if (amtRead == 0) {
+                    break;
+                }
+                if (!growbuffer_append(&(data.gb), buffer, amtRead)) {
+                    fprintf(stderr, "\nERROR: Out of memory while reading "
+                            "stdin\n");
+                    exit(-1);
+                }
+                contentLength += amtRead;
+                if (amtRead < (int) sizeof(buffer)) {
+                    break;
+                }
+            }
+        }
+        else {
+            data.infile = stdin;
+        }
+    }
+
+    data.totalContentLength =
+    data.totalOriginalContentLength =
+    data.contentLength =
+    data.originalContentLength =
+            contentLength;
+
+    S3_init();
+
+    head_data.appendable = 0;
+    head_data.nextAppendPosition = 0;
+
+    S3BucketContext bucketContext =
+    {
+        0,
+        bucketName,
+        protocolG,
+        uriStyleG,
+        accessKeyIdG,
+        secretAccessKeyG,
+        0,
+        awsRegionG
+    };
+
+    S3ResponseHandler responseHandler =
+    {
+        &responsePropertiesForHeadBeforeAppendCallback,
+        &responseCompleteCallback
+    };
+
+    do {
+        S3_head_object(&bucketContext, key, 0, 0, &responseHandler, &head_data);
+    } while (S3_status_is_retryable(statusG) && should_retry());
+
+    if ((statusG != S3StatusOK) &&
+        (statusG != S3StatusHttpErrorNotFound)) {
+        printError();
+    }
+
+    if (head_data.appendable == 0 && statusG == S3StatusOK) {
+        fprintf(stderr, "\nERROR: Target object is not appendable \n");
+        exit(-1);
+    }
+
+    S3PutProperties putProperties =
+    {
+        contentType,
+        md5,
+        cacheControl,
+        contentDispositionFilename,
+        contentEncoding,
+        expires,
+        cannedAcl,
+        metaPropertiesCount,
+        metaProperties,
+        useServerSideEncryption
+    };
+
+    
+    S3PutObjectHandler putObjectHandler =
+    {
+        { &responsePropertiesCallback, &responseCompleteCallback },
+        &appendObjectDataCallback
+    };
+
+    do {
+        S3_append_object(&bucketContext, key, contentLength, head_data.nextAppendPosition, &putProperties, 0,
+                        0, &putObjectHandler, &data);
+    } while (S3_status_is_retryable(statusG) && should_retry());
+
+    if (data.infile) {
+        fclose(data.infile);
+    }
+    else if (data.gb) {
+        growbuffer_destroy(data.gb);
+    }
+
+    if (statusG != S3StatusOK) {
+        printError();
+    }
+    else if (data.contentLength) {
+        fprintf(stderr, "\nERROR: Failed to read remaining %llu bytes from "
+                "input\n", (unsigned long long) data.contentLength);
+    }
+    
+    
+    S3_deinitialize();
+}
+
+
 // copy object ---------------------------------------------------------------
 static S3Status copyListKeyCallback(int isTruncated, const char *nextMarker,
                                     int contentsCount,
@@ -4003,6 +4423,9 @@ int main(int argc, char **argv)
     }
     else if (!strcmp(command, "put")) {
         put_object(argc, argv, optind, NULL, NULL, 0);
+    }
+    else if (!strcmp(command, "append")) {
+        append_object(argc, argv, optind);
     }
     else if (!strcmp(command, "copy")) {
         copy_object(argc, argv, optind);
