@@ -44,6 +44,7 @@ typedef enum
     HttpRequestTypeGET,
     HttpRequestTypeHEAD,
     HttpRequestTypePUT,
+    HttpRequestTypeAPPEND,
     HttpRequestTypeCOPY,
     HttpRequestTypeDELETE,
     HttpRequestTypePOST,
@@ -88,6 +89,9 @@ typedef struct RequestParams
 
     // Put properties
     const S3PutProperties *putProperties;
+
+    // Append properties
+    // const S3AppendProperties *appendProperties;
 
     // Callback to be made when headers are available.  Might not be called.
     S3ResponsePropertiesCallback *propertiesCallback;

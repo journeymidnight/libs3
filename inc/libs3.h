@@ -575,6 +575,22 @@ typedef struct S3ResponseProperties
     uint64_t contentLength;
 
     /**
+     * This optional field is the content length of the data which is returned
+     * in the response.  A negative value means that this value was not
+     * provided in the response.  A value of 0 means that there is no content
+     * provided.  A positive value gives the number of bytes in the content of
+     * the response.
+     **/
+    uint64_t nextAppendPosition;
+
+    /**
+     * This optional field is the content type of the data which is returned
+     * by the request.  If not provided, the default can be assumed to be
+     * "binary/octet-stream".
+     **/
+    const char *objectType;
+    
+    /**
      * This optional field names the server which serviced the request.
      **/
     const char *server;
@@ -917,6 +933,90 @@ typedef struct S3PutProperties
 
 
 /**
+ * S3PutProperties is the set of properties that may optionally be set by the
+ * user when putting objects to S3.  Each field of this structure is optional
+ * and may or may not be present.
+ **/
+typedef struct S3AppendProperties
+{
+    /**
+     * If present, this is the Content-Type that should be associated with the
+     * object.  If not provided, S3 defaults to "binary/octet-stream".
+     **/
+    const char *contentType;
+
+    /**
+     * If present, this provides the MD5 signature of the contents, and is
+     * used to validate the contents.  This is highly recommended by Amazon
+     * but not required.  Its format is as a base64-encoded MD5 sum.
+     **/
+    const char *md5;
+
+    /**
+     * If present, this gives a Cache-Control header string to be supplied to
+     * HTTP clients which download this
+     **/
+    const char *cacheControl;
+
+    /**
+     * If present, this gives the filename to save the downloaded file to,
+     * whenever the object is downloaded via a web browser.  This is only
+     * relevent for objects which are intended to be shared to users via web
+     * browsers and which is additionally intended to be downloaded rather
+     * than viewed.
+     **/
+    const char *contentDispositionFilename;
+
+    /**
+     * If present, this identifies the content encoding of the object.  This
+     * is only applicable to encoded (usually, compressed) content, and only
+     * relevent if the object is intended to be downloaded via a browser.
+     **/
+    const char *contentEncoding;
+
+    /**
+     * If >= 0, this gives an expiration date for the content.  This
+     * information is typically only delivered to users who download the
+     * content via a web browser.
+     **/
+    int64_t expires;
+
+    /**
+     * This identifies the "canned ACL" that should be used for this object.
+     * The default (0) gives only the owner of the object access to it.
+     **/
+    S3CannedAcl cannedAcl;
+
+    /**
+     * This is the number of values in the metaData field.
+     **/
+    int metaDataCount;
+
+    /**
+     * These are the meta data to pass to S3.  In each case, the name part of
+     * the Name - Value pair should not include any special S3 HTTP header
+     * prefix (i.e., should be of the form 'foo', NOT 'x-amz-meta-foo').
+     **/
+    const S3NameValue *metaData;
+
+    /**
+     * This a boolean value indicating whether or not the object should be
+     * stored by Amazon S3 using server-side encryption, wherein the data is
+     * encrypted by Amazon before being stored on permanent medium.
+     * Server-side encryption does not affect the data as it is sent to or
+     * received by Amazon, the encryption is applied by Amazon when objects
+     * are put and then de-encryption is applied when the objects are read by
+     * clients.
+     * If this value is 0, then server-side encryption is not used; if this
+     * value is non-zero, then server-side encryption is used.  Note that the
+     * encryption status of the object can be checked by ensuring that the put
+     * response has the usesServerSideEncryption flag set.
+     **/
+    char useServerSideEncryption;
+} S3AppendProperties;
+
+
+/**
  * S3GetConditions is used for the get_object operation, and specifies
  * conditions which the object must meet in order to be successfully returned.
  **/
@@ -1120,6 +1220,28 @@ typedef S3Status (S3ListBucketCallback)(int isTruncated,
  *        bytes that were written into the buffer by this callback
  **/
 typedef int (S3PutObjectDataCallback)(int bufferSize, char *buffer,
+                                      void *callbackData);
+
+
+/**
+ * This callback is made during a put object operation, to obtain the next
+ * chunk of data to put to the S3 service as the contents of the object.  This
+ * callback is made repeatedly, each time acquiring the next chunk of data to
+ * write to the service, until a negative or 0 value is returned.
+ *
+ * @param bufferSize gives the maximum number of bytes that may be written
+ *        into the buffer parameter by this callback
+ * @param buffer gives the buffer to fill with at most bufferSize bytes of
+ *        data as the next chunk of data to send to S3 as the contents of this
+ *        object
+ * @param callbackData is the callback data as specified when the request
+ *        was issued.
+ * @return < 0 to abort the request with the S3StatusAbortedByCallback, which
+ *        will be pased to the response complete callback for this request, or
+ *        0 to indicate the end of data, or > 0 to identify the number of
+ *        bytes that were written into the buffer by this callback
+ **/
+typedef int (S3AppendObjectDataCallback)(int bufferSize, char *buffer,
                                       void *callbackData);
 
 
@@ -1356,6 +1478,27 @@ typedef struct S3PutObjectHandler
      **/
     S3PutObjectDataCallback *putObjectDataCallback;
 } S3PutObjectHandler;
+
+
+/**
+ * An S3PutObjectHandler defines the callbacks which are made for
+ * put_object requests.
+ **/
+typedef struct S3AppendObjectHandler
+{
+    /**
+     * responseHandler provides the properties and complete callback
+     **/
+    S3ResponseHandler responseHandler;
+
+    /**
+     * The putObjectDataCallback is called to acquire data to send to S3 as
+     * the contents of the put_object request.  It is made repeatedly until it
+     * returns a negative number (indicating that the request should be
+     * aborted), or 0 (indicating that all data has been supplied).
+     **/
+    S3AppendObjectDataCallback *appendObjectDataCallback;
+} S3AppendObjectHandler;
 
 
 /**
@@ -2045,6 +2188,36 @@ void S3_list_bucket(const S3BucketContext *bucketContext,
 void S3_put_object(const S3BucketContext *bucketContext, const char *key,
                    uint64_t contentLength,
                    const S3PutProperties *putProperties,
+                   S3RequestContext *requestContext,
+                   int timeoutMs,
+                   const S3PutObjectHandler *handler, void *callbackData);
+
+
+/**
+ * Puts object data to S3.  This overwrites any existing object at that key;
+ * note that S3 currently only supports full-object upload.  The data to
+ * upload will be acquired by calling the handler's putObjectDataCallback.
+ *
+ * @param bucketContext gives the bucket and associated parameters for this
+ *        request
+ * @param key is the key of the object to put to
+ * @param contentLength is required and gives the total number of bytes that
+ *        will be put
+ * @param putProperties optionally provides additional properties to apply to
+ *        the object that is being put to
+ * @param requestContext if non-NULL, gives the S3RequestContext to add this
+ *        request to, and does not perform the request immediately.  If NULL,
+ *        performs the request immediately and synchronously.
+ * @param timeoutMs if not 0 contains total request timeout in milliseconds
+ * @param handler gives the callbacks to call as the request is processed and
+ *        completed
+ * @param callbackData will be passed in as the callbackData parameter to
+ *        all callbacks for this request
+ **/
+void S3_append_object(const S3BucketContext *bucketContext, const char *key,
+                   uint64_t contentLength,
+                   uint64_t position,
+                   const S3PutProperties *appendProperties,
                    S3RequestContext *requestContext,
                    int timeoutMs,
                    const S3PutObjectHandler *handler, void *callbackData);
