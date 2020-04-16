@@ -2194,15 +2194,18 @@ void S3_put_object(const S3BucketContext *bucketContext, const char *key,
 
 
 /**
- * Puts object data to S3.  This overwrites any existing object at that key;
- * note that S3 currently only supports full-object upload.  The data to
- * upload will be acquired by calling the handler's putObjectDataCallback.
+ * Append object data to S3.  This append new data to an existing object or 
+ * create a new object at that key;
+ * The data to upload will be acquired by calling the handler's 
+ * putObjectDataCallback.
  *
  * @param bucketContext gives the bucket and associated parameters for this
  *        request
  * @param key is the key of the object to put to
  * @param contentLength is required and gives the total number of bytes that
  *        will be put
+ * @param position is required and gives the postion that will be append, this
+ *        should be the same as the length of existing object
  * @param putProperties optionally provides additional properties to apply to
  *        the object that is being put to
  * @param requestContext if non-NULL, gives the S3RequestContext to add this
